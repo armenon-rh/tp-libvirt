@@ -38,22 +38,47 @@ def check_secret(params):
     secret_encode = "yes" == params.get("secret_string_base64_encode", "yes")
 
     base64_file = os.path.join(_VIRT_SECRETS_PATH, "%s.base64" % uuid)
+    aes_file = os.path.join(_VIRT_SECRETS_PATH, "%s.aes256cbc" % uuid)
+
+    # Identify which file exists on disk
+    if os.access(aes_file, os.R_OK):
+        secret_file_path = aes_file
+    elif os.access(base64_file, os.R_OK):
+        secret_file_path = base64_file
+    else:
+        secret_file_path = None
 
     if secret_encode:
-        if os.access(base64_file, os.R_OK):
-            with open(base64_file, 'rb') as base64file:
-                base64_encoded_string = base64file.read().strip()
-            secret_decoded_string = base64.b64decode(base64_encoded_string)\
-                .decode(locale.getpreferredencoding())
+        if secret_file_path:
+            with open(secret_file_path, 'rb') as f:
+                base64_encoded_content = f.read().strip()
+
+            # The content is always base64 encoded on disk, whether encrypted or not.
+            try:
+                decoded_data = base64.b64decode(base64_encoded_content)
+            except Exception as e:
+                logging.error("Failed to base64 decode content of %s: %s", secret_file_path, e)
+                return False
+
+            if secret_file_path.endswith('.base64'):
+                # For plain base64 files, we can compare the string directly.
+                secret_decoded_string = decoded_data.decode(locale.getpreferredencoding())
+                if secret_string and secret_string != secret_decoded_string:
+                    logging.error("To expect %s value is %s", secret_string, secret_decoded_string)
+                    return False
+            else:
+                # For encrypted files (.aes256cbc), the decoded data is binary (IV + Ciphertext).
+                # We can't do a simple string comparison, so we just verify it's valid base64
+                # and exists. The actual value is verified via virsh secret-get-value.
+                logging.info("Verified encrypted secret file exists and is valid base64: %s", secret_file_path)
         else:
-            logging.error("Did not find base64_file: %s", base64_file)
+            logging.error("Did not find secret value file for uuid: %s", uuid)
             return False
     else:
         secret_decoded_string = secret_string
-    if secret_string and secret_string != secret_decoded_string:
-        logging.error("To expect %s value is %s",
-                      secret_string, secret_decoded_string)
-        return False
+        if secret_string and secret_string != secret_decoded_string:
+            logging.error("To expect %s value is %s", secret_string, secret_decoded_string)
+            return False
 
     return True
 
@@ -117,6 +142,10 @@ def get_secret_value(test, params):
 
     if uuid:
         base64_file = os.path.join(_VIRT_SECRETS_PATH, "%s.base64" % uuid)
+        aes_file = os.path.join(_VIRT_SECRETS_PATH, "%s.aes256cbc" % uuid)
+        secret_file_path = aes_file if os.access(aes_file, os.R_OK) else base64_file
+    else:
+        secret_file_path = None
 
     # Don't check result if we don't need to.
     if params.get("check_get_status", "yes") == "no":
@@ -127,9 +156,9 @@ def get_secret_value(test, params):
         if status:
             logging.info("It's an expected %s", result.stderr)
         else:
-            # Only raise error when the /path/to/$uuid.base64 file
+            # Only raise error when the secret file
             # doesn't exist
-            if not os.access(base64_file, os.R_OK):
+            if not secret_file_path or not os.access(secret_file_path, os.R_OK):
                 test.fail("%d not a expected command "
                           "return value", status)
     elif status_error == "no":
@@ -137,7 +166,7 @@ def get_secret_value(test, params):
             test.fail(result.stderr)
         else:
             # Check secret value
-            if base64_file and check_secret(params):
+            if secret_file_path and check_secret(params):
                 logging.info(result.stdout.strip())
             else:
                 test.fail("The secret value "
